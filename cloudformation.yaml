@@ -1,0 +1,693 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template for deploying the infrastructure for the Automate management of Amazon WorkSpace and Amazon
+
+Parameters: 
+  vpcCidrParameter:
+    Description: VPC CIDR Block
+    Type: String
+    Default: 10.100.0.0/22
+
+  priSubnet1Parameter: 
+        Type: String
+        Description: CIDR Block for Private Subnet 1
+        Default: 10.100.0.0/24
+  
+  priSubnet2Parameter: 
+    Type: String
+    Description: CIDR Block For Private Subnet 2
+    Default: 10.100.1.0/24
+
+  pubSubnet1Parameter: 
+    Type: String
+    Description: CIDR Block for Public Subnet 1
+    Default: 10.100.2.0/24
+
+  DirectoryFqdnParameter: 
+      Description: Fully Qualified Domain Name of Managed Directory
+      Type: String
+      Default: workspaces.labx.com
+
+  NETBIOSParameter:
+    Type: String
+    Description: The NETBIOS name of your domain
+    Default: workspaces
+  
+  CreateAS2Role:
+    Description: Set this to true if you need to create the AppStreamServiceAccess role. Setting it to false will skip deploying the AppStream 2.0 service role.
+    Default: true
+    Type: String
+    AllowedValues: [true,false]
+
+  CreateWksRole:
+    Description: Set this to true if you need to create the workspaces_DefaultRole role. Setting it to false will skip deploying the WorkSpaces service role.
+    Default: true
+    Type: String
+    AllowedValues: [true,false]
+
+Conditions:
+  CreateAppStreamRole: !Equals [!Ref CreateAS2Role, "true"]
+  CreateWorkspacesRole: !Equals [!Ref CreateWksRole, "true"]
+
+# Amazon WorkSpaces is available in a subset of the Availability Zones for each supported Region.
+# https://docs.aws.amazon.com/workspaces/latest/adminguide/azs-workspaces.html
+Mappings:
+  RegionMap:
+    us-east-1:
+      az1: use1-az2
+      az2: use1-az4
+      az3: use1-az6
+    us-west-2:
+      az1: usw2-az1
+      az2: usw2-az2
+      az3: usw2-az3
+    ap-south-1:
+      az1: aps1-az1
+      az2: aps1-az2
+      az3: aps1-az3
+    ap-northeast-2:
+      az1: apne2-az1
+      az2: apne2-az3
+    ap-southeast-1:
+      az1: apse1-az1
+      az2: apse1-az2
+    ap-southeast-2:
+      az1: apse2-az1
+      az2: apse2-az3
+    ap-northeast-1:
+      az1: apne1-az1
+      az2: apne1-az4
+    ca-central-1:
+      az1: cac1-az1
+      az2: cac1-az2
+    eu-central-1:
+      az1: euc1-az2
+      az2: euc1-az3
+    eu-west-1:
+      az1: euw1-az1
+      az2: euw1-az2
+    eu-west-2:
+      az1: euw2-az2
+      az2: euw2-az3
+    sa-east-1:
+      az1: sae1-az1
+      az2: sae1-az3
+      
+Resources: 
+  iamLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "The Amazon EC2 ec2:Describe* API actions do not support resource-level permissions" 
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: describe-ec2-az
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeAvailabilityZones'
+                Resource: '*'
+      MaxSessionDuration: 3600
+      Path: /service-role/
+
+  fnZoneIdtoZoneName:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This function is used to determine which AZs to deploy the subnets in."
+          - id: W92
+            reason: "This function only runs twice to select private subnets." 
+    Properties:
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def zoneId_to_zoneName(event, context):
+              responseData = {}
+              ec2 = boto3.client('ec2')
+              describe_az = ec2.describe_availability_zones()
+              for az in describe_az['AvailabilityZones']:
+                  if event['ResourceProperties']['ZoneId'] == az['ZoneId']:
+                      responseData['ZoneName'] = az['ZoneName']
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, str(az['ZoneId']))
+                      
+          def no_op(event, context):
+              print(event)
+              responseData = {}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, str(event['RequestId']))
+
+          def lambda_handler(event, context):
+              if event['RequestType'] == ('Create' or 'Update'):
+                  zoneId_to_zoneName(event, context)
+              else:
+                  no_op(event,context)
+      Role: !GetAtt iamLambdaExecutionRole.Arn
+
+  getAZ1:
+    Type: "Custom::zone-id-zone-name"
+    Properties:
+      ServiceToken: !GetAtt fnZoneIdtoZoneName.Arn
+      ZoneId: !FindInMap [ RegionMap, !Ref 'AWS::Region', az1 ]
+
+  getAZ2:
+    Type: "Custom::zone-id-zone-name"
+    Properties:
+      ServiceToken: !GetAtt fnZoneIdtoZoneName.Arn
+      ZoneId: !FindInMap [ RegionMap, !Ref 'AWS::Region', az2 ]
+
+  asServiceRole:
+      Type: 'AWS::IAM::Role'
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W28
+              reason: "Explicit name is needed for servic role."
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - appstream.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /service-role/
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonAppStreamServiceAccess
+        RoleName: AmazonAppStreamServiceAccess
+      Condition: CreateAppStreamRole
+  
+  wksDefaultRole:
+    Type: 'AWS::IAM::Role'
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W28
+              reason: "Explicit name is needed for servic role."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - workspaces.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonWorkSpacesSelfServiceAccess
+        - arn:aws:iam::aws:policy/AmazonWorkSpacesServiceAccess
+      RoleName: workspaces_DefaultRole
+    Condition: CreateWorkspacesRole
+
+  vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: "For the purposes of this workshop, VPC flow logs are not enabled" 
+    Properties:
+      CidrBlock: !Ref vpcCidrParameter
+      EnableDnsSupport: true
+
+  privateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !GetAtt getAZ1.ZoneName
+      VpcId: !Ref vpc
+      CidrBlock: !Ref priSubnet1Parameter
+  
+  privateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !GetAtt getAZ2.ZoneName
+      VpcId: !Ref vpc
+      CidrBlock: !Ref priSubnet2Parameter
+  
+  publicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !GetAtt getAZ1.ZoneName
+      VpcId: !Ref vpc
+      CidrBlock: !Ref pubSubnet1Parameter
+
+  privateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+
+  privateRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetA
+      RouteTableId: !Ref privateRouteTable
+  
+  privateRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetB
+      RouteTableId: !Ref privateRouteTable
+
+  publicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+
+  publicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      RouteTableId: !Ref publicRouteTable
+  
+  igw:
+    Type: AWS::EC2::InternetGateway
+
+  igwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref vpc
+      InternetGatewayId: !Ref igw
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+        Domain: vpc
+  
+  NATGateway:
+   Type: AWS::EC2::NatGateway
+   Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref publicSubnetA
+
+  RouteNATGateway:
+    DependsOn: NATGateway
+    Type: AWS::EC2::Route
+    Properties:
+        RouteTableId: !Ref privateRouteTable
+        DestinationCidrBlock: '0.0.0.0/0'
+        NatGatewayId: !Ref NATGateway
+
+  RouteInternetGateway:
+    DependsOn: 
+      - igw
+      - igwAttachment
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref publicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref igw
+      
+  hostedZone: 
+    Type: "AWS::Route53::HostedZone"
+    Properties: 
+      HostedZoneConfig: 
+        Comment: 'Private Hosted Zone for WKS Lab'
+      Name: !Ref DirectoryFqdnParameter
+      VPCs: 
+        - 
+          VPCId: !Ref vpc
+          VPCRegion: !Ref 'AWS::Region'
+
+  wksSg:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is needed for workshop users to identify security group for use during workshop."
+          - id: W40
+            reason: "Egress access allowed to all for purpose of this lab." 
+          - id: W42
+            reason: "Egress access allowed to all for purpose of this lab."
+          - id: W5
+            reason: "Egress access allowed to all for purpose of this lab."
+          - id: W9
+            reason: "Ingress allowed only to lab VPC."
+    Properties:
+      GroupDescription: WorkSpaces security group for RDP and Remote Assist
+      GroupName: WksLabSecurityGroup
+      SecurityGroupIngress: 
+        - CidrIp: 10.100.0.0/22
+          Description: Allow access to WorkSpaces from VPC
+          FromPort: -1
+          IpProtocol: -1
+          ToPort: -1
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound acces
+          FromPort: -1
+          IpProtocol: -1
+          ToPort: -1
+      VpcId: !Ref vpc
+  
+  outboundResolver:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Direction: OUTBOUND
+      IpAddresses: 
+        - SubnetId: !Ref privateSubnetA
+        - SubnetId: !Ref privateSubnetB
+      SecurityGroupIds: 
+        - !GetAtt vpc.DefaultSecurityGroup
+  
+  resolverRule:
+    Type: AWS::Route53Resolver::ResolverRule
+    Properties:
+      Name:  wks-lab-resolver
+      DomainName: !Ref DirectoryFqdnParameter
+      ResolverEndpointId: !Ref outboundResolver
+      RuleType: FORWARD
+      TargetIps: 
+        - Ip: !Select [0, !GetAtt ManagedAD.DnsIpAddresses]
+        - Ip: !Select [1, !GetAtt ManagedAD.DnsIpAddresses]
+
+  resolverAssoc:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      Name: wks-lab-assoc
+      ResolverRuleId: !Ref resolverRule
+      VPCId: !Ref vpc
+
+  ADAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: For this workshop we will not specify the KMS key explicitly.
+    Properties:
+      Name: "ADAdminSecret"
+      Description: "Password for directory services admin"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "Admin"}'
+        GenerateStringKey: password
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+  
+  ManagedAD: 
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties: 
+      Name: !Ref DirectoryFqdnParameter
+      Password: '{{resolve:secretsmanager:ADAdminSecret:SecretString:password}}'
+      VpcSettings: 
+        SubnetIds: 
+          - Ref: privateSubnetA
+          - Ref: privateSubnetB
+        VpcId: 
+          Ref: vpc
+  
+
+  DirectoryConfig:
+    DependsOn:
+      - ADAdminSecret
+    Type: AWS::AppStream::DirectoryConfig
+    Properties:
+      DirectoryName: !Ref DirectoryFqdnParameter
+      OrganizationalUnitDistinguishedNames: 
+        - "OU=Computers,OU=workspaces,DC=workspaces,DC=labx,DC=com"
+      ServiceAccountCredentials: 
+        AccountName: !Join ["\\", [!Ref NETBIOSParameter, "Admin"]]
+        AccountPassword: '{{resolve:secretsmanager:ADAdminSecret:SecretString:password}}'
+  
+  ImageBuilder:
+    DependsOn: 
+      - ManagedAD
+      - resolverRule
+      - resolverAssoc
+      - DirectoryConfig
+    Type: AWS::AppStream::ImageBuilder
+    Properties: 
+      Description: ImageBuilder for WorkShop
+      DisplayName: WorkShop Image Builder
+      EnableDefaultInternetAccess: false
+      IamRoleArn: !GetAtt appstreamIAMRole.Arn
+      ImageName: AppStream-WinServer2019-06-12-2023
+      InstanceType: stream.standard.medium
+      Name: WksImageBuilder
+      DomainJoinInfo: 
+        DirectoryName: !Ref DirectoryFqdnParameter
+        OrganizationalUnitDistinguishedName: "OU=Computers,OU=workspaces,DC=workspaces,DC=labx,DC=com"
+      VpcConfig:
+        SubnetIds: [!Ref privateSubnetA]
+
+  appStreamFleet:
+    Type: AWS::AppStream::Fleet
+    Properties: 
+      ComputeCapacity: 
+        DesiredInstances: 2
+      Description: Workshop AppStream Fleet
+      IamRoleArn: !GetAtt appstreamIAMRole.Arn
+      FleetType: ALWAYS_ON
+      ImageName: AppStream-WinServer2019-06-12-2023
+      InstanceType: stream.standard.medium
+      Name: WorkshopFleet
+      StreamView: DESKTOP   
+      VpcConfig:
+        SubnetIds: [
+          !Ref privateSubnetA,
+          !Ref privateSubnetB
+        ]
+    CreationPolicy:
+        StartFleet: true
+  
+  appStreamStack:
+    Type: AWS::AppStream::Stack
+    Properties: 
+      Description: Workshop AppStream Stack
+      DisplayName: Workshop Stack
+      Name: WorkshopStack
+  
+  fleetAssoc:
+    Type: AWS::AppStream::StackFleetAssociation
+    Properties: 
+      FleetName: !Ref appStreamFleet
+      StackName: !Ref appStreamStack
+  
+  appstreamIAMRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - workspaces.amazonaws.com
+                - appstream.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: WorkShop IAM Role
+      Path: /
+      
+  
+  appstreamIAMPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Allowing access to all (*) resources for the purpose of this lab."
+          - id: W12
+            reason: "Allowing access to all (*) resources for the purpose of this lab."
+    Properties: 
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - workspaces:DescribeWorkspaceBundles
+              - workspaces:DescribeWorkspaceDirectories
+              - workspaces:DescribeWorkspaceSnapshots
+              - workspaces:DescribeWorkspaces
+              - workspaces:MigrateWorkspace
+              - workspaces:ModifyWorkspaceProperties
+              - workspaces:ModifyWorkspaceState
+              - workspaces:RebootWorkspaces
+              - workspaces:RebuildWorkspaces
+              - workspaces:RestoreWorkspace
+              - workspaces:StartWorkspaces
+              - workspaces:StopWorkspaces
+              - workspaces:TerminateWorkspaces                  
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - appstream:DescribeSessions
+              - appstream:DescribeStacks
+              - appstream:ExpireSession
+              - appstream:ListAssociatedFleets          
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cloudwatch:GetMetricWidgetImage
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - logs:DescribeQueries
+              - logs:GetQueryResults
+              - logs:StartQuery
+            Resource: "*"
+      PolicyName: WorkshopEUCPolicy
+      Roles: 
+        - !Ref appstreamIAMRole
+  
+  CustomResource:
+    Type: "AWS::CloudFormation::CustomResource"
+    Properties:
+      ServiceToken: !GetAtt MADRegisterFunction.Arn
+
+  MADRegisterFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This function is used to register the MAD with WorkSpaces."
+          - id: W92
+            reason: "This function only runs once." 
+    DependsOn: ManagedAD
+    Properties:
+      Code:
+       ZipFile: |
+        import cfnresponse
+        import boto3
+        import os
+        import time
+        def lambda_handler(event, context):
+            print(event)
+            client = boto3.client('workspaces')
+            response = client.register_workspace_directory(
+                    DirectoryId= os.environ['DIRECTORY_ID'],
+                    SubnetIds=[
+                        os.environ['PRIVATE_SUBNET_A'],
+                        os.environ['PRIVATE_SUBNET_B']
+                    ],
+                    EnableWorkDocs=False,
+                    EnableSelfService=False,
+                  )
+            responseData = {}
+            responseData['Data'] = response
+            time.sleep(120)
+            cfnresponse.send(event,context, cfnresponse.SUCCESS, responseData)
+      Description: Register MAD for WorkSpaces
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          DIRECTORY_ID: !Ref ManagedAD
+          PRIVATE_SUBNET_A: !Ref privateSubnetA
+          PRIVATE_SUBNET_B: !Ref privateSubnetB
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Allow all (*) for the purpose of this lab."
+          - id: F3
+            reason: "Action * allowed for the purpose of this lab."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - workspaces.amazonaws.com
+                - ds.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - "workspaces:*"
+                  - "ds:*"
+                  - "iam:GetRole"
+                  - "iam:CreateRole"
+                  - "iam:PutRolePolicy"
+                  - "iam:CreatePolicy"
+                  - "iam:AttachRolePolicy"
+                  - "iam:ListRoles"
+                  - "kms:ListAliases"
+                  - "kms:ListKeys"
+                  - "ec2:CreateVpc"
+                  - "ec2:CreateSubnet"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:CreateInternetGateway"
+                  - "ec2:CreateRouteTable"
+                  - "ec2:CreateRoute"
+                  - "ec2:CreateTags"
+                  - "ec2:CreateSecurityGroup"
+                  - "ec2:DescribeInternetGateways"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeRouteTables"
+                  - "ec2:DescribeVpcs"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DescribeAvailabilityZones"
+                  - "ec2:AttachInternetGateway"
+                  - "ec2:AssociateRouteTable"
+                  - "ec2:AuthorizeSecurityGroupEgress"
+                  - "ec2:AuthorizeSecurityGroupIngress"
+                  - "ec2:DeleteSecurityGroup"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:RevokeSecurityGroupEgress"
+                  - "ec2:RevokeSecurityGroupIngress"
+                Resource: "*"
+
+  AdminWorkSpace:
+    Type: AWS::WorkSpaces::Workspace
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F29
+            reason: "For the purpose of this workshop, the WorkSpace needs to be unencrypted for image creation"
+    DependsOn: CustomResource
+    Properties: 
+      BundleId: wsb-6cbvhvv9f
+      DirectoryId: !Ref ManagedAD
+      RootVolumeEncryptionEnabled: False
+      UserName: Admin
+      UserVolumeEncryptionEnabled: False
+      WorkspaceProperties: 
+        ComputeTypeName: STANDARD
+        RunningMode: ALWAYS_ON
+
+
+    
