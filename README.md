@@ -1,6 +1,6 @@
-## Getting Started with Amazon WorkSpaces workshop template
+## Automate the management of Amazon WorkSpaces and Amazon AppStream 2.0 workshop template
 
-This repository contains the AWS CloudFormation template to provision the prerequisites for the [Automate management of Amazon WorkSpaces and Amazon AppStream 2.0 ](https://workspaces.workshop.aws/).
+This repository contains the AWS CloudFormation template to provision the prerequisites for the [Automate the management of Amazon WorkSpaces and Amazon AppStream 2.0](https://workspaces.workshop.aws/).
 
 ### What is created
 - VPC
